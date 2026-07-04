@@ -42,6 +42,12 @@ public:
     Q_INVOKABLE QString readHtmlPage(const QString &htmlPath, int page) const;
     Q_INVOKABLE void extractHtmlPageAsync(const QString &htmlPath, int page) const;
 
+    Q_INVOKABLE bool saveMarkdownNote(const QString &htmlPath, const QString &fileName, const QString &content) const;
+    Q_INVOKABLE QString readTextFile(const QString &path) const;
+    Q_INVOKABLE QString markdownToHtml(const QString &markdown) const;
+    Q_INVOKABLE bool saveTextFile(const QString &path, const QString &content) const;
+    Q_INVOKABLE bool deleteNoteFile(const QString &path) const;
+
 signals:
     void isConvertingChanged();
     void knowledgeBaseDirChanged();

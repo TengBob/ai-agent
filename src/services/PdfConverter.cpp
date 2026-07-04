@@ -17,6 +17,7 @@
 #include <QMetaObject>
 #include <QThread>
 #include <QDateTime>
+#include <QTextDocument>
 
 static const char *SETTING_KB_DIR = "knowledgeBaseDir";
 static const char *SETTING_PDF2HTMLEX = "pdf2HtmlEXPath";
@@ -562,7 +563,7 @@ bool PdfConverter::openHtmlFile(const QString &htmlPath)
 QVariantList PdfConverter::scanHtmlFiles(const QString &base, const QHash<QString, QString> &dirToTitle) const
 {
     QVariantList result;
-    QDirIterator it(base, {"*.html", "*.htm"}, QDir::Files,
+    QDirIterator it(base, {"*.html", "*.htm", "*.md"}, QDir::Files,
                     QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
@@ -571,10 +572,14 @@ QVariantList PdfConverter::scanHtmlFiles(const QString &base, const QHash<QStrin
         const QString rel = QDir(base).relativeFilePath(fullPath);
         const QString parentDir = it.fileInfo().dir().dirName();
         const QString parentPath = QDir::fromNativeSeparators(it.fileInfo().dir().absolutePath());
+        const QString suffix = it.fileInfo().suffix().toLower();
+        const bool isMarkdown = (suffix == "md");
 
         QString displayName = fileName;
         if (fileName.toLower() == "index.html") {
             displayName = dirToTitle.value(parentPath, parentDir);
+        } else if (isMarkdown) {
+            displayName = it.fileInfo().completeBaseName();
         }
 
         result.append(QVariantMap{
@@ -583,6 +588,7 @@ QVariantList PdfConverter::scanHtmlFiles(const QString &base, const QHash<QStrin
             {"path",        fullPath},
             {"relPath",     rel},
             {"dir",         parentDir},
+            {"isMarkdown",  isMarkdown},
         });
     }
     std::sort(result.begin(), result.end(), [](const QVariant &a, const QVariant &b) {
@@ -894,6 +900,68 @@ void PdfConverter::extractHtmlPageAsync(const QString &htmlPath, int page) const
                                       Q_ARG(QString, tmpPath));
         }
     });
+}
+
+bool PdfConverter::saveMarkdownNote(const QString &htmlPath, const QString &fileName, const QString &content) const
+{
+    if (htmlPath.isEmpty() || fileName.isEmpty()) return false;
+    const QFileInfo fi(htmlPath);
+    const QString dir = fi.absolutePath();
+    if (dir.isEmpty()) return false;
+
+    QString name = fileName;
+    if (!name.endsWith(".md", Qt::CaseInsensitive))
+        name += ".md";
+
+    const QString path = QDir(dir).absoluteFilePath(name);
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+        return false;
+    QTextStream out(&f);
+    out.setEncoding(QStringConverter::Utf8);
+    out << content;
+    f.close();
+    qDebug() << "[PdfConverter] saved markdown note:" << path;
+    return true;
+}
+
+QString PdfConverter::readTextFile(const QString &path) const
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QString();
+    QTextStream in(&f);
+    in.setEncoding(QStringConverter::Utf8);
+    return in.readAll();
+}
+
+QString PdfConverter::markdownToHtml(const QString &markdown) const
+{
+    QTextDocument doc;
+    doc.setMarkdown(markdown);
+    return doc.toHtml();
+}
+
+bool PdfConverter::saveTextFile(const QString &path, const QString &content) const
+{
+    if (path.isEmpty()) return false;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+        return false;
+    QTextStream out(&f);
+    out.setEncoding(QStringConverter::Utf8);
+    out << content;
+    f.close();
+    qDebug() << "[PdfConverter] saved text file:" << path;
+    return true;
+}
+
+bool PdfConverter::deleteNoteFile(const QString &path) const
+{
+    if (path.isEmpty()) return false;
+    const bool ok = QFile::remove(path);
+    qDebug() << "[PdfConverter] delete note file:" << path << (ok ? "ok" : "failed");
+    return ok;
 }
 
 QString PdfConverter::buildKnowledgeBasePrompt()

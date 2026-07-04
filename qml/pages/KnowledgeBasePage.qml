@@ -77,7 +77,7 @@ Page {
         const msgs = chatEngine.currentMessages()
         for (let i = 0; i < msgs.length; i++) {
             const m = msgs[i]
-            kbChatModel.append({ role: m.role, content: m.content, timestamp: m.timestamp })
+            kbChatModel.append({ role: m.role, content: m.content, timestamp: m.timestamp, selectedForNote: false })
         }
         Qt.callLater(function() { kbChatView.positionViewAtEnd() })
     }
@@ -97,6 +97,15 @@ Page {
         htmlCurrentPage = targetPage
         htmlCurrentInput = "" + targetPage
         htmlTotalPages = 0
+
+        const isMarkdown = /\.md$/i.test(path)
+        if (isMarkdown) {
+            // Render markdown notes as HTML so they display properly.
+            const mdText = pdfConverter.readTextFile(path)
+            const html = pdfConverter.markdownToHtml(mdText)
+            webView.loadHtml(html, "file:///")
+            return
+        }
 
         // Always display the original HTML file directly in WebEngineView.
         webView.url = "file:///" + path.replace(/\\/g, "/")
@@ -135,7 +144,7 @@ Page {
 
     function onKbChatMessage(role, content, timestamp) {
         if (role === "system" || role === "user") return
-        kbChatModel.append({ role: role, content: content, timestamp: timestamp })
+        kbChatModel.append({ role: role, content: content, timestamp: timestamp, selectedForNote: false })
         Qt.callLater(function() { kbChatView.positionViewAtEnd() })
     }
 
@@ -157,6 +166,9 @@ Page {
     property int    savedHtmlPage: 1
     property var    htmlPageMap: ({})
 
+    property string editingNotePath: ""
+    property string pendingDeleteNotePath: ""
+
     // Defer WebEngineView visibility: the Chromium render process starts when the
     // view first becomes visible and blocks the event loop. Let the page UI paint
     // first, then reveal the view in a subsequent event loop iteration.
@@ -167,6 +179,117 @@ Page {
         // Single-page extraction is no longer used for the web view.
         // This handler is kept for compatibility in case it is called elsewhere.
         console.log("[KB] htmlPageExtracted (unused):", htmlPath, "page", page, "tmp", tmpPath)
+    }
+
+    function generateStudyNote() {
+        if (selectedHtmlPath === "") {
+            errorBar.text = "请先打开一个 HTML 文档"
+            errorBar.visible = true
+            errorTimer.restart()
+            return
+        }
+
+        let selectedCount = 0
+        for (let i = 0; i < kbChatModel.count; i++) {
+            if (kbChatModel.get(i).selectedForNote) selectedCount++
+        }
+        if (selectedCount === 0) {
+            errorBar.text = "请勾选要加入笔记的对话"
+            errorBar.visible = true
+            errorTimer.restart()
+            return
+        }
+
+        const fileName = selectedHtmlPath.split(/[/\\]/).pop()
+        const docName = fileName.replace(/\.html?$/i, "")
+        const noteFileName = docName + "学习笔记"
+        const timestamp = Qt.formatDateTime(new Date(), "yyyy-MM-dd hh:mm:ss")
+
+        let content = "# " + noteFileName + "\n\n"
+        content += "- **文档**：" + docName + "\n"
+        content += "- **阅读位置**：第 " + htmlCurrentPage + " 页\n"
+        content += "- **生成时间**：" + timestamp + "\n\n"
+
+        for (let i = 0; i < kbChatModel.count; i++) {
+            const m = kbChatModel.get(i)
+            if (!m.selectedForNote) continue
+            if (m.role === "user") {
+                content += "## 问题\n\n" + m.content + "\n\n"
+            } else if (m.role === "assistant") {
+                content += "## 回答\n\n" + m.content + "\n\n"
+            }
+        }
+
+        if (pdfConverter.saveMarkdownNote(selectedHtmlPath, noteFileName, content)) {
+            loadHtmlFiles()
+            errorBar.color = "#E8F5E9"
+            errorBar.border.color = "#81C784"
+            errorBar.text = "笔记已保存：" + noteFileName + ".md"
+            errorBar.visible = true
+            errorTimer.restart()
+        } else {
+            errorBar.color = "#FFEBEE"
+            errorBar.border.color = "#F44336"
+            errorBar.text = "保存笔记失败"
+            errorBar.visible = true
+            errorTimer.restart()
+        }
+    }
+
+    function openNoteEditor(path) {
+        editingNotePath = path
+        noteEditArea.text = pdfConverter.readTextFile(path)
+        noteEditDialog.open()
+    }
+
+    function saveNoteEdit() {
+        if (editingNotePath === "") return
+        if (pdfConverter.saveTextFile(editingNotePath, noteEditArea.text)) {
+            noteEditDialog.close()
+            if (selectedHtmlPath === editingNotePath)
+                loadHtmlFile(editingNotePath, 1)
+            loadHtmlFiles()
+            errorBar.color = "#E8F5E9"
+            errorBar.border.color = "#81C784"
+            errorBar.text = "笔记已更新"
+            errorBar.visible = true
+            errorTimer.restart()
+        } else {
+            errorBar.color = "#FFEBEE"
+            errorBar.border.color = "#F44336"
+            errorBar.text = "保存笔记失败"
+            errorBar.visible = true
+            errorTimer.restart()
+        }
+        editingNotePath = ""
+    }
+
+    function confirmDeleteNote(path) {
+        pendingDeleteNotePath = path
+        noteDeleteConfirmDialog.open()
+    }
+
+    function doDeleteNote() {
+        if (pendingDeleteNotePath === "") return
+        if (pdfConverter.deleteNoteFile(pendingDeleteNotePath)) {
+            if (selectedHtmlPath === pendingDeleteNotePath) {
+                selectedHtmlPath = ""
+                webViewReady = false
+            }
+            loadHtmlFiles()
+            errorBar.color = "#E8F5E9"
+            errorBar.border.color = "#81C784"
+            errorBar.text = "笔记已删除"
+            errorBar.visible = true
+            errorTimer.restart()
+        } else {
+            errorBar.color = "#FFEBEE"
+            errorBar.border.color = "#F44336"
+            errorBar.text = "删除笔记失败"
+            errorBar.visible = true
+            errorTimer.restart()
+        }
+        pendingDeleteNotePath = ""
     }
 
     function checkTool() {
@@ -310,6 +433,60 @@ Page {
                 wrapMode: Text.Wrap
                 Layout.fillWidth: true
             }
+        }
+    }
+
+    Dialog {
+        id: noteEditDialog
+        title: "编辑学习笔记"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width * 0.8, 720)
+        height: Math.min(parent.height * 0.8, 540)
+        standardButtons: Dialog.Save | Dialog.Cancel
+        onAccepted: saveNoteEdit()
+        onRejected: editingNotePath = ""
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 8
+
+            Text {
+                text: editingNotePath
+                font.pixelSize: 11
+                color: "#616161"
+                elide: Text.ElideMiddle
+                Layout.fillWidth: true
+            }
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+
+                TextArea {
+                    id: noteEditArea
+                    wrapMode: TextArea.Wrap
+                    font.pixelSize: 13
+                    selectByMouse: true
+                    background: Rectangle { radius: 6; color: "#F5F5F5"; border.color: "#E0E0E0" }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: noteDeleteConfirmDialog
+        title: "删除笔记"
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: doDeleteNote()
+        onRejected: pendingDeleteNotePath = ""
+
+        Text {
+            text: "确定要删除这条学习笔记吗？"
+            font.pixelSize: 13
+            color: "#212121"
         }
     }
 
@@ -777,7 +954,7 @@ Page {
                                 }
                             }
                             Text {
-                                text: "HTML 目录"
+                                text: "文件目录"
                                 font.pixelSize: 14; font.bold: true; color: "#424242"
                                 Layout.fillWidth: true
                             }
@@ -816,11 +993,11 @@ Page {
                             Row {
                                 anchors { left: parent.left; leftMargin: 12; right: parent.right; rightMargin: 8; verticalCenter: parent.verticalCenter }
                                 spacing: 8
-                                Text { text: "🌐"; font.pixelSize: 16; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: model.isMarkdown ? "📝" : "🌐"; font.pixelSize: 16; anchors.verticalCenter: parent.verticalCenter }
                                 Column {
                                     spacing: 2
                                     anchors.verticalCenter: parent.verticalCenter
-                                    width: parent.width - 30
+                                    width: parent.width - (model.isMarkdown ? 70 : 30)
                                     Text {
                                         text: model.displayName
                                         font.pixelSize: 12; font.bold: true; color: "#212121"
@@ -848,6 +1025,37 @@ Page {
                                         kbInput.text = "关于文件《" + fileName + "》："
                                         kbInput.forceActiveFocus()
                                         kbInput.cursorPosition = kbInput.text.length
+                                    }
+                                }
+                            }
+
+                            Row {
+                                anchors { right: parent.right; rightMargin: 8; verticalCenter: parent.verticalCenter }
+                                spacing: 4
+                                visible: model.isMarkdown && htmlHover.containsMouse
+
+                                Rectangle {
+                                    width: 26; height: 26; radius: 4
+                                    color: editNoteHover.containsMouse ? "#E3F2FD" : "transparent"
+                                    Text { anchors.centerIn: parent; text: "✎"; font.pixelSize: 14; color: "#1976D2" }
+                                    ToolTip.visible: editNoteHover.containsMouse
+                                    ToolTip.text: "编辑笔记"
+                                    MouseArea {
+                                        id: editNoteHover
+                                        anchors.fill: parent; hoverEnabled: true
+                                        onClicked: openNoteEditor(model.path)
+                                    }
+                                }
+                                Rectangle {
+                                    width: 26; height: 26; radius: 4
+                                    color: delNoteHover.containsMouse ? "#FFEBEE" : "transparent"
+                                    Text { anchors.centerIn: parent; text: "🗑"; font.pixelSize: 14; color: "#E53935" }
+                                    ToolTip.visible: delNoteHover.containsMouse
+                                    ToolTip.text: "删除笔记"
+                                    MouseArea {
+                                        id: delNoteHover
+                                        anchors.fill: parent; hoverEnabled: true
+                                        onClicked: confirmDeleteNote(model.path)
                                     }
                                 }
                             }
@@ -937,7 +1145,7 @@ Page {
                         }
 
                         Rectangle {
-                            visible: selectedHtmlPath !== "" && htmlCurrentPage > 0
+                            visible: selectedHtmlPath !== "" && htmlCurrentPage > 0 && !/\.md$/i.test(selectedHtmlPath)
                             width: 76; height: 28; radius: 4
                             color: savePosHov.containsMouse ? "#E3F2FD" : "transparent"
                             border.color: "#1976D2"; border.width: 1
@@ -1163,6 +1371,26 @@ Page {
                                 Layout.fillWidth: true; elide: Text.ElideRight
                             }
                             Rectangle {
+                                width: 86; height: 26; radius: 4
+                                color: noteBtnHov.containsMouse ? "#E3F2FD" : "transparent"
+                                border.color: "#1976D2"; border.width: 1
+                                enabled: selectedHtmlPath !== "" && kbChatModel.count > 0
+                                opacity: enabled ? 1.0 : 0.5
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "生成笔记"
+                                    font.pixelSize: 11; color: "#1976D2"
+                                }
+                                ToolTip.visible: noteBtnHov.containsMouse
+                                ToolTip.text: "将勾选的对话保存为学习笔记"
+                                MouseArea {
+                                    id: noteBtnHov
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: generateStudyNote()
+                                }
+                            }
+                            Rectangle {
                                 width: 28; height: 28; radius: 4
                                 color: switchAgentHov.containsMouse ? "#E0E0E0" : "transparent"
                                 Text { anchors.centerIn: parent; text: "⇄"; font.pixelSize: 16; color: "#616161" }
@@ -1213,6 +1441,16 @@ Page {
                                     top: parent.top; topMargin: 4
                                 }
                                 width: Math.min(kbChatView.width * 0.82, 360)
+
+                                CheckBox {
+                                    anchors.right: parent.right
+                                    height: 22
+                                    padding: 0
+                                    checked: model.selectedForNote
+                                    onClicked: kbChatModel.setProperty(index, "selectedForNote", checked)
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "加入学习笔记"
+                                }
 
                                 Rectangle {
                                     width: parent.width
@@ -1315,7 +1553,7 @@ Page {
                                     const txt = kbInput.text.trim()
                                     if (txt.length === 0 || chatAgentId < 0) return
 
-                                    kbChatModel.append({ role: "user", content: txt, timestamp: Qt.formatTime(new Date(), "hh:mm:ss") })
+                                    kbChatModel.append({ role: "user", content: txt, timestamp: Qt.formatTime(new Date(), "hh:mm:ss"), selectedForNote: false })
                                     Qt.callLater(function() { kbChatView.positionViewAtEnd() })
 
                                     let ctx = txt
