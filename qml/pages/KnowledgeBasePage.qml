@@ -4,6 +4,7 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import QtWebEngine
+import QtWebChannel
 import "../components"
 
 Page {
@@ -91,7 +92,6 @@ Page {
             return
         }
 
-        htmlPagePollLocked = true
         selectedHtmlPath = path
         const targetPage = Math.max(1, page)
         htmlCurrentPage = targetPage
@@ -118,9 +118,35 @@ Page {
             })
         }
 
-        // Load the current page text as agent context. readHtmlPage uses memory
-        // mapping, so even large files are handled in a background thread.
-        chatEngine.loadFilePage(path, targetPage)
+        // We no longer extract text on every page turn; the context is read
+        // lazily from C++ when the user actually sends a message.
+    }
+
+    function installScrollDetector() {
+        if (/\.md$/i.test(selectedHtmlPath)) return
+        webView.runJavaScript(`
+(function() {
+    if (window.__kbScrollInstalled) return;
+    window.__kbScrollInstalled = true;
+    var pc = document.getElementById('page-container');
+    if (!pc) return;
+    var timer = null;
+    pc.addEventListener('scroll', function() {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function() {
+            var pfs = pc.querySelectorAll('div.pf');
+            if (pfs.length === 0) return;
+            var sy = pc.scrollTop;
+            for (var i = 0; i < pfs.length; i++) {
+                if (pfs[i].offsetTop + pfs[i].offsetHeight * 0.5 > sy) {
+                    console.log('__KB_PAGE__:' + (i + 1));
+                    break;
+                }
+            }
+        }, 300);
+    }, {passive: true});
+})();
+        `)
     }
 
     property string toolLogText: ""
@@ -162,18 +188,41 @@ Page {
     property int    htmlTotalPages:  0
     property int    htmlCurrentPage: 1
     property string htmlCurrentInput: "1"
-    property bool   htmlPagePollLocked: false
     property int    savedHtmlPage: 1
     property var    htmlPageMap: ({})
 
     property string editingNotePath: ""
     property string pendingDeleteNotePath: ""
 
+    // Track an externally-opened document so we can auto-select it once it appears
+    // in the file list (PDF after conversion, HTML/MD after scan).
+    property int    pendingOpenDocId: -1
+    property string pendingOpenPath: ""
+
     // Defer WebEngineView visibility: the Chromium render process starts when the
     // view first becomes visible and blocks the event loop. Let the page UI paint
     // first, then reveal the view in a subsequent event loop iteration.
     property bool   webViewReady: false
     property var    pendingWebViewLoad: null
+
+    // Bridge used by the WebEngineView scroll detector to report the current
+    // page without polling.
+    WebChannel {
+        id: kbWebChannel
+        registeredObjects: [kbBridge]
+    }
+    QtObject {
+        id: kbBridge
+        objectName: "kbBridge"
+        function reportPage(page) {
+            if (!page || page < 1 || page === htmlCurrentPage) return
+            htmlCurrentPage = page
+            htmlCurrentInput = "" + page
+            if (selectedHtmlPath !== "" && !/\.md$/i.test(selectedHtmlPath)) {
+                chatEngine.prefetchPage(selectedHtmlPath, page)
+            }
+        }
+    }
 
     function onHtmlPageExtracted(htmlPath, page, tmpPath) {
         // Single-page extraction is no longer used for the web view.
@@ -202,29 +251,52 @@ Page {
 
         const fileName = selectedHtmlPath.split(/[/\\]/).pop()
         const docName = fileName.replace(/\.html?$/i, "")
-        const noteFileName = docName + "学习笔记"
+        const noteBaseName = docName + "学习笔记"
+        const noteFileName = noteBaseName + ".md"
         const timestamp = Qt.formatDateTime(new Date(), "yyyy-MM-dd hh:mm:ss")
 
-        let content = "# " + noteFileName + "\n\n"
-        content += "- **文档**：" + docName + "\n"
-        content += "- **阅读位置**：第 " + htmlCurrentPage + " 页\n"
-        content += "- **生成时间**：" + timestamp + "\n\n"
+        // Compute the target note path safely for both / and \ separators.
+        const normalizedPath = selectedHtmlPath.replace(/\\/g, "/")
+        const noteDir = normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
+        const notePath = noteDir + "/" + noteFileName
+        const fileExists = pdfConverter.fileExists(notePath)
+
+        let content = ""
+        if (fileExists) {
+            // Append a new page entry to the existing note.
+            content += "\n---\n\n"
+            content += "## 📍 第 " + htmlCurrentPage + " 页 — " + timestamp + "\n\n"
+        } else {
+            // Create the note with a full header.
+            content += "# " + docName + " 学习笔记\n\n"
+            content += "> 📄 文档：" + docName + "\n"
+            content += "> 📅 创建时间：" + timestamp + "\n"
+            content += "> 📂 来源：" + selectedHtmlPath + "\n\n"
+            content += "---\n\n"
+            content += "## 📍 第 " + htmlCurrentPage + " 页 — " + timestamp + "\n\n"
+        }
 
         for (let i = 0; i < kbChatModel.count; i++) {
             const m = kbChatModel.get(i)
             if (!m.selectedForNote) continue
             if (m.role === "user") {
-                content += "## 问题\n\n" + m.content + "\n\n"
+                content += "### ❓ 问题\n\n" + m.content + "\n\n"
             } else if (m.role === "assistant") {
-                content += "## 回答\n\n" + m.content + "\n\n"
+                content += "### 💡 回答\n\n" + m.content + "\n\n"
             }
         }
 
-        if (pdfConverter.saveMarkdownNote(selectedHtmlPath, noteFileName, content)) {
+        if (pdfConverter.saveMarkdownNote(selectedHtmlPath, noteBaseName, content, fileExists)) {
+            // 清空所有勾选，避免下次生成笔记时重复写入
+            for (let i = 0; i < kbChatModel.count; i++) {
+                kbChatModel.setProperty(i, "selectedForNote", false)
+            }
             loadHtmlFiles()
             errorBar.color = "#E8F5E9"
             errorBar.border.color = "#81C784"
-            errorBar.text = "笔记已保存：" + noteFileName + ".md"
+            errorBar.text = fileExists
+                ? "笔记已追加到：" + noteFileName + "（第 " + htmlCurrentPage + " 页）"
+                : "笔记已创建：" + noteFileName
             errorBar.visible = true
             errorTimer.restart()
         } else {
@@ -335,6 +407,35 @@ Page {
     function onConversionFinished(docId, success, error) {
         loadDocuments()
         loadHtmlFiles()
+
+        if (pendingOpenDocId >= 0 && docId === pendingOpenDocId) {
+            const wasPending = pendingOpenDocId
+            pendingOpenDocId = -1
+            if (success) {
+                let htmlPath = ""
+                let outputDir = ""
+                for (let i = 0; i < docModel.count; i++) {
+                    const d = docModel.get(i)
+                    if (d.id === docId) {
+                        htmlPath = d.htmlPath || ""
+                        outputDir = d.outputDir || ""
+                        break
+                    }
+                }
+                const targetPath = htmlPath || (outputDir.replace(/\\$/g, "") + "/index.html")
+                if (targetPath !== "/index.html" && pdfConverter.fileExists(targetPath)) {
+                    selectedDocId = docId
+                    updateSelectedDoc()
+                    loadHtmlFile(targetPath, 1)
+                }
+            } else {
+                errorBar.text = error
+                errorBar.visible = true
+                errorTimer.restart()
+            }
+            return
+        }
+
         if (!success) {
             errorBar.text = error
             errorBar.visible = true
@@ -352,6 +453,19 @@ Page {
         for (const f of files) {
             htmlFileModel.append(f)
         }
+
+        if (pendingOpenPath !== "") {
+            const target = pendingOpenPath.replace(/\\/g, "/")
+            for (let i = 0; i < htmlFileModel.count; i++) {
+                const p = htmlFileModel.get(i).path.replace(/\\/g, "/")
+                if (p === target) {
+                    pendingOpenPath = ""
+                    const f = htmlFileModel.get(i)
+                    loadHtmlFile(f.path, 1)
+                    break
+                }
+            }
+        }
     }
 
     FileDialog {
@@ -361,6 +475,38 @@ Page {
         onAccepted: {
             const path = selectedFile.toString().replace("file:///", "")
             pdfConverter.convertPdf(path)
+        }
+    }
+
+    FileDialog {
+        id: externalDocDialog
+        title: "打开外部文档"
+        nameFilters: [
+            "PDF 文件 (*.pdf)",
+            "HTML 文件 (*.html *.htm)",
+            "Markdown 文件 (*.md)",
+            "所有文件 (*)"
+        ]
+        onAccepted: {
+            const path = selectedFile.toString().replace("file:///", "")
+            const res = pdfConverter.openExternalDocument(path)
+            const docId = res.docId !== undefined ? res.docId : -1
+            const destPath = res.destPath !== undefined ? res.destPath : ""
+            pendingOpenDocId = docId
+            pendingOpenPath = destPath
+            if (docId < 0) {
+                errorBar.text = "打开文档失败"
+                errorBar.visible = true
+                errorTimer.restart()
+            } else if (docId === 0) {
+                errorBar.text = "正在导入文档，请稍候..."
+                errorBar.visible = true
+                errorTimer.restart()
+            } else {
+                errorBar.text = "PDF 已导入，正在转换..."
+                errorBar.visible = true
+                errorTimer.restart()
+            }
         }
     }
 
@@ -589,6 +735,12 @@ Page {
                 Material.foreground: "white"
                 Material.background: enabled ? "#1976D2" : "#BDBDBD"
                 onClicked: pdfDialog.open()
+            }
+            Button {
+                text: "📂 打开文档"
+                flat: true
+                font.pixelSize: 12
+                onClicked: externalDocDialog.open()
             }
             Button {
                 text: chatAgentId > 0 ? ("🤖 " + chatAgentName) : "🤖 与 Agent 对话"
@@ -1212,11 +1364,21 @@ Page {
                     id: webView
                     anchors { top: previewToolbar.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
                     visible: webViewReady
+                    webChannel: kbWebChannel
                     settings.javascriptEnabled: true
                     settings.localContentCanAccessFileUrls: true
 
                     onVisibleChanged: {
                         console.log("[KB] webView visible:", visible, "url:", url)
+                    }
+
+                    onJavaScriptConsoleMessage: function(level, message, lineNumber, sourceID) {
+                        if (!message) return
+                        const prefix = '__KB_PAGE__:'
+                        if (message.indexOf(prefix) === 0) {
+                            const page = parseInt(message.substring(prefix.length), 10)
+                            kbBridge.reportPage(page)
+                        }
                     }
 
                     Rectangle {
@@ -1247,7 +1409,6 @@ Page {
                         htmlCurrentPage = page
                         htmlCurrentInput = "" + page
                         runJavaScript("var el=document.querySelector('div.pf[data-page-no=\\'" + page + "\\']'); if(el) el.scrollIntoView({behavior:'instant',block:'start'});")
-                        chatEngine.loadFilePage(selectedHtmlPath, page)
                     }
 
                     onLoadingChanged: function(req) {
@@ -1262,57 +1423,16 @@ Page {
 })();
                             `)
                             updatePageCount()
-                            htmlPagePollLocked = false
-                        } else if (req.status === WebEngineView.LoadStartedStatus) {
-                            htmlPagePollLocked = true
+                            installScrollDetector()
+                            // Prefetch the landing page once; further pages come
+                            // from the WebChannel scroll detector.
+                            chatEngine.prefetchPage(selectedHtmlPath, htmlCurrentPage)
                         } else if (req.status === WebEngineView.LoadFailedStatus) {
-                            htmlPagePollLocked = true
                             console.warn("[WebView] load failed:", req.errorString)
                             errorBar.text = "页面加载失败：" + (req.errorString || "未知错误")
                             errorBar.visible = true
                             errorTimer.restart()
                         }
-                    }
-                }
-
-                Timer {
-                    id: pagePollTimer
-                    interval: 500
-                    repeat: true
-                    running: selectedHtmlPath !== "" && !webView.loading && !chatEngine.isLoading
-                    onTriggered: {
-                        if (htmlPagePollLocked || webView.loading) return
-                        webView.runJavaScript(`
-(function(){
-    var pc=document.getElementById('page-container');
-    if(!pc) return 1;
-    var pages=pc.querySelectorAll('div.pf');
-    if(pages.length===0) return 1;
-    var sy=pc.scrollTop;
-    var vh=pc.clientHeight;
-    for(var i=pages.length-1;i>=0;i--){
-        var y=pages[i].offsetTop-sy;
-        if(y<vh) return i+1;
-    }
-    return 1;
-})()
-                        `, function(result) {
-                            if (result && result !== htmlCurrentPage) {
-                                htmlCurrentPage = result
-                                htmlCurrentInput = "" + result
-                                pageContextTimer.restart()
-                            }
-                        })
-                    }
-                }
-
-                Timer {
-                    id: pageContextTimer
-                    interval: 600
-                    repeat: false
-                    onTriggered: {
-                        if (selectedHtmlPath !== "" && htmlCurrentPage > 0)
-                            chatEngine.loadFilePage(selectedHtmlPath, htmlCurrentPage)
                     }
                 }
 
@@ -1556,13 +1676,13 @@ Page {
                                     kbChatModel.append({ role: "user", content: txt, timestamp: Qt.formatTime(new Date(), "hh:mm:ss"), selectedForNote: false })
                                     Qt.callLater(function() { kbChatView.positionViewAtEnd() })
 
-                                    let ctx = txt
-                                    if (selectedHtmlPath !== "" && htmlCurrentPage > 0 && htmlCurrentPage <= htmlTotalPages) {
-                                        const fileName = selectedHtmlPath.split(/[/\\]/).pop()
-                                        ctx = txt + "\n\n【当前阅读位置】文件：" + fileName + "，页码：" + htmlCurrentPage +
-                                              "。如需参考此页内容，请使用 read_html_page(file_path='" + selectedHtmlPath.replace(/\\/g, "/") + "', page=" + htmlCurrentPage + ") 工具读取。"
+                                    if (selectedHtmlPath !== "" && htmlCurrentPage > 0
+                                        && !/\.md$/i.test(selectedHtmlPath)) {
+                                        chatEngine.setCurrentFileContext(selectedHtmlPath, htmlCurrentPage)
+                                    } else {
+                                        chatEngine.setCurrentFileContext("", 0)
                                     }
-                                    chatEngine.sendMessage(ctx)
+                                    chatEngine.sendMessage(txt)
                                     kbInput.text = ""
                                 }
 

@@ -10,6 +10,8 @@
 #include "llm/LLMClient.h"
 #include "tools/ToolExecutor.h"
 
+class PageTextCache;
+
 class ChatEngine : public QObject
 {
     Q_OBJECT
@@ -40,6 +42,10 @@ public:
     Q_INVOKABLE void setContextFile(const QString &filePath);
     Q_INVOKABLE void loadFileContent(const QString &filePath);
     Q_INVOKABLE void loadFilePage(const QString &filePath, int page);
+    Q_INVOKABLE void setCurrentFileContext(const QString &filePath, int page);
+
+    // Prefetch page text in background after scroll stops.
+    Q_INVOKABLE void prefetchPage(const QString &filePath, int page);
 
     static void setPdfConverter(class PdfConverter *converter);
 
@@ -63,6 +69,11 @@ private:
     void saveAndEmit(const QString &role, const QString &content,
                      int tokIn = 0, int tokOut = 0);
 
+    QString buildContextualPrompt(const QString &filePath, int page,
+                                  const QString &pageText,
+                                  const QString &userContent);
+    void doSendMessage(const QString &finalContent);
+
 private slots:
     void handleToolResults(QStringList results);
 
@@ -73,8 +84,11 @@ private:
     NoteDao       m_noteDao;
     AgentData     m_agent;
     static class PdfConverter *s_pdfConverter;
+    PageTextCache *m_pageCache = nullptr;
     QString       m_contextFile;
     QString       m_contextContent;
+    int           m_contextPage = 0;
+    QString       m_pendingMessage;  // stored when async fallback is needed
     int           m_convId   = -1;
     bool          m_loading  = false;
     int           m_totalIn  = 0;

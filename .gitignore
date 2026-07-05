@@ -82,3 +82,11 @@ CMakeLists.txt.user*
 .uic/
 /build*/
 /.qtcreator/
+/.sisyphus/
+/pdf2htmlEX/
+
+# Sensitive / local files
+*.db
+*.sqlite
+.env
+.env.*

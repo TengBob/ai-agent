@@ -447,6 +447,77 @@ int PdfConverter::convertPdf(const QString &pdfPath)
     return docId;
 }
 
+QVariantMap PdfConverter::openExternalDocument(const QString &filePath)
+{
+    auto errorResult = [&](const QString &msg) -> QVariantMap {
+        emit conversionFinished(-1, false, msg);
+        return QVariantMap{{"docId", -1}, {"destPath", QString()}};
+    };
+
+    if (filePath.isEmpty())
+        return QVariantMap{{"docId", -1}, {"destPath", QString()}};
+
+    const QFileInfo srcInfo(filePath);
+    if (!srcInfo.exists())
+        return QVariantMap{{"docId", -1}, {"destPath", QString()}};
+
+    if (!ensureKnowledgeBaseDir())
+        return errorResult("无法创建知识库目录");
+
+    const QString kbDir = knowledgeBaseDir();
+    const QString suffix = srcInfo.suffix().toLower();
+    const QString baseName = srcInfo.completeBaseName();
+
+    auto makeUniqueFilePath = [&](const QString &dir, const QString &name) -> QString {
+        QString candidate = dir + "/" + name;
+        if (!QFileInfo::exists(candidate)) return candidate;
+        const QString stem = name.left(name.lastIndexOf('.'));
+        const QString ext = name.mid(name.lastIndexOf('.'));
+        for (int i = 2; i < 1000; ++i) {
+            candidate = dir + "/" + stem + "_" + QString::number(i) + ext;
+            if (!QFileInfo::exists(candidate)) return candidate;
+        }
+        return QString();
+    };
+
+    auto makeUniqueDirPath = [&](const QString &dir, const QString &name) -> QString {
+        QString candidate = dir + "/" + name;
+        if (!QFileInfo::exists(candidate)) return candidate;
+        for (int i = 2; i < 1000; ++i) {
+            candidate = dir + "/" + name + "_" + QString::number(i);
+            if (!QFileInfo::exists(candidate)) return candidate;
+        }
+        return QString();
+    };
+
+    if (suffix == "pdf") {
+        const QString destPath = makeUniqueFilePath(kbDir, srcInfo.fileName());
+        if (destPath.isEmpty())
+            return errorResult("无法生成唯一文件名");
+        if (!QFile::copy(filePath, destPath))
+            return errorResult("复制 PDF 失败");
+        const int docId = convertPdf(destPath);
+        return QVariantMap{{"docId", docId}, {"destPath", destPath}};
+    }
+
+    if (suffix == "html" || suffix == "htm" || suffix == "md") {
+        // Put standalone HTML/MD files into their own subdirectory so they
+        // don't collide with converted document index.html files.
+        const QString destDir = makeUniqueDirPath(kbDir, baseName);
+        if (destDir.isEmpty())
+            return errorResult("无法生成唯一目录名");
+        QDir().mkpath(destDir);
+        const QString destPath = destDir + "/" + srcInfo.fileName();
+        if (!QFile::copy(filePath, destPath))
+            return errorResult("复制文件失败");
+        scanHtmlFilesAsync();
+        emit documentsChanged();
+        return QVariantMap{{"docId", 0}, {"destPath", destPath}};
+    }
+
+    return errorResult("不支持的文件格式: " + suffix);
+}
+
 void PdfConverter::onProcessReadyRead()
 {
     if (!m_process) return;
@@ -902,7 +973,8 @@ void PdfConverter::extractHtmlPageAsync(const QString &htmlPath, int page) const
     });
 }
 
-bool PdfConverter::saveMarkdownNote(const QString &htmlPath, const QString &fileName, const QString &content) const
+bool PdfConverter::saveMarkdownNote(const QString &htmlPath, const QString &fileName,
+                                    const QString &content, bool append) const
 {
     if (htmlPath.isEmpty() || fileName.isEmpty()) return false;
     const QFileInfo fi(htmlPath);
@@ -914,15 +986,47 @@ bool PdfConverter::saveMarkdownNote(const QString &htmlPath, const QString &file
         name += ".md";
 
     const QString path = QDir(dir).absoluteFilePath(name);
+
+    QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Text;
+    if (append && QFileInfo::exists(path)) {
+        mode |= QIODevice::Append;
+
+        // Ensure the file ends with a newline so the appended separator looks right.
+        QFile check(path);
+        if (check.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const qint64 size = check.size();
+            if (size > 0) {
+                check.seek(size - 1);
+                char lastChar = 0;
+                if (check.getChar(&lastChar) && lastChar != '\n') {
+                    check.close();
+                    QFile pad(path);
+                    if (pad.open(QIODevice::Append | QIODevice::Text)) {
+                        pad.write("\n");
+                        pad.close();
+                    }
+                }
+            }
+            check.close();
+        }
+    } else {
+        mode |= QIODevice::Truncate;
+    }
+
     QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+    if (!f.open(mode))
         return false;
     QTextStream out(&f);
     out.setEncoding(QStringConverter::Utf8);
     out << content;
     f.close();
-    qDebug() << "[PdfConverter] saved markdown note:" << path;
+    qDebug() << "[PdfConverter] saved markdown note (append=" << append << "):" << path;
     return true;
+}
+
+bool PdfConverter::fileExists(const QString &path) const
+{
+    return QFileInfo::exists(path);
 }
 
 QString PdfConverter::readTextFile(const QString &path) const

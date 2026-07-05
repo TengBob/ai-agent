@@ -30,6 +30,11 @@ public:
     Q_INVOKABLE void openDownloadPage() const;
 
     Q_INVOKABLE int convertPdf(const QString &pdfPath);
+    // Copy a PDF/HTML/MD from another directory into the knowledge base and
+    // start conversion (PDF) or refresh the file list (HTML/MD).
+    // Returns { docId, destPath } where docId is -1 on error, 0 for HTML/MD,
+    // and >0 for PDF; destPath is the copied file path for HTML/MD.
+    Q_INVOKABLE QVariantMap openExternalDocument(const QString &filePath);
     Q_INVOKABLE bool reconvertPdf(int docId);
     Q_INVOKABLE bool deleteDocument(int docId);
     Q_INVOKABLE bool openInBrowser(int docId);
@@ -42,7 +47,9 @@ public:
     Q_INVOKABLE QString readHtmlPage(const QString &htmlPath, int page) const;
     Q_INVOKABLE void extractHtmlPageAsync(const QString &htmlPath, int page) const;
 
-    Q_INVOKABLE bool saveMarkdownNote(const QString &htmlPath, const QString &fileName, const QString &content) const;
+    Q_INVOKABLE bool saveMarkdownNote(const QString &htmlPath, const QString &fileName,
+                                       const QString &content, bool append = false) const;
+    Q_INVOKABLE bool fileExists(const QString &path) const;
     Q_INVOKABLE QString readTextFile(const QString &path) const;
     Q_INVOKABLE QString markdownToHtml(const QString &markdown) const;
     Q_INVOKABLE bool saveTextFile(const QString &path, const QString &content) const;

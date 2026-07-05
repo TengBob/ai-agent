@@ -2,6 +2,7 @@
 #include "tools/ToolRegistry.h"
 #include "models/NoteData.h"
 #include "services/PdfConverter.h"
+#include "services/PageTextCache.h"
 #include <QDateTime>
 #include <QJsonObject>
 #include <QDebug>
@@ -22,6 +23,7 @@ ChatEngine::ChatEngine(QObject *parent)
     : QObject(parent)
     , m_client(new LLMClient(this))
     , m_executor(new ToolExecutor(this))
+    , m_pageCache(new PageTextCache(this))
 {
     // LLM returned plain text response
     connect(m_client, &LLMClient::responseReady, this,
@@ -69,6 +71,34 @@ void ChatEngine::setLoading(bool v)
 void ChatEngine::setTavilyKey(const QString &key)  { m_executor->setTavilyKey(key); }
 void ChatEngine::setWorkDir(const QString &dir)     { m_executor->setWorkDir(dir); }
 void ChatEngine::setContextFile(const QString &filePath) { m_contextFile = filePath; }
+
+void ChatEngine::setCurrentFileContext(const QString &filePath, int page)
+{
+    m_contextFile = filePath;
+    m_contextPage = page;
+}
+
+void ChatEngine::prefetchPage(const QString &filePath, int page)
+{
+    if (filePath.isEmpty() || page < 1) return;
+    if (!s_pdfConverter) return;
+
+    // Already cached — nothing to do.
+    if (m_pageCache->get(filePath, page).has_value()) return;
+
+    QtConcurrent::run([this, filePath, page]() {
+        QString text = s_pdfConverter->readHtmlPage(filePath, page);
+        if (text.startsWith("Error:") || text.startsWith("无法") || text.startsWith("未找到")) {
+            qWarning() << "prefetchPage:" << text;
+            return;
+        }
+        if (!text.isEmpty()) {
+            m_pageCache->put(filePath, page, text);
+            qDebug() << "[Chat] prefetched page" << page << "len" << text.length()
+                     << "for" << filePath;
+        }
+    });
+}
 
 static QString fastHtmlToText(QString html)
 {
@@ -245,17 +275,74 @@ void ChatEngine::sendMessage(const QString &content)
     if (m_loading || content.trimmed().isEmpty()) return;
     if (m_convId < 0) { emit errorOccurred("未选择对话"); return; }
 
-    QString finalContent = content.trimmed();
-    if (!m_contextContent.isEmpty()) {
-        const QString fileName = m_contextFile.isEmpty()
-            ? "当前文件"
-            : m_contextFile.split('/').last().split('\\').last();
-        finalContent = "【以下是我正在浏览的文件《" + fileName + "》当前页的内容片段，已经直接提供给你。"
-                       "请直接基于以下内容回答我的问题，不要调用 read_file 或 read_html_page 等文件读取工具。】\n"
-                       + m_contextContent + "\n\n【我的问题】\n" + finalContent;
+    const QString userContent = content.trimmed();
+    QString finalContent = userContent;
+
+    // ── Contextual prompt: only look up cache on the main thread ──
+    if (!m_contextFile.isEmpty() && m_contextPage > 0) {
+        auto cached = m_pageCache->get(m_contextFile, m_contextPage);
+
+        if (cached.has_value()) {
+            // ═══ Fast path: prefetch already finished ═══
+            finalContent = buildContextualPrompt(m_contextFile, m_contextPage,
+                                                 cached.value(), finalContent);
+            saveAndEmit("user", userContent);
+            doSendMessage(finalContent);
+        } else {
+            // ═══ Fallback: rare case where user sends before prefetch completes ═══
+            m_pendingMessage = finalContent;
+            saveAndEmit("user", userContent);
+            setLoading(true);
+
+            QtConcurrent::run([this, path = m_contextFile, page = m_contextPage]() {
+                QString text;
+                if (s_pdfConverter) {
+                    text = s_pdfConverter->readHtmlPage(path, page);
+                    if (!text.isEmpty() &&
+                        !text.startsWith("Error:") &&
+                        !text.startsWith("无法") &&
+                        !text.startsWith("未找到")) {
+                        m_pageCache->put(path, page, text);
+                    }
+                }
+                QMetaObject::invokeMethod(this, [this, path, page, text]() {
+                    QString final = buildContextualPrompt(path, page, text,
+                                                          m_pendingMessage);
+                    m_pendingMessage.clear();
+                    doSendMessage(final);
+                }, Qt::QueuedConnection);
+            });
+        }
+        return;
     }
 
-    saveAndEmit("user", content.trimmed());
+    // No file context — send directly.
+    saveAndEmit("user", userContent);
+    doSendMessage(finalContent);
+}
+
+QString ChatEngine::buildContextualPrompt(const QString &filePath, int page,
+                                          const QString &pageText,
+                                          const QString &userContent)
+{
+    if (pageText.isEmpty() || filePath.isEmpty() || page < 1)
+        return userContent;
+
+    const QString fileName = filePath.split('/').last().split('\\').last();
+    constexpr int MAX_LEN = 4000;
+    QString clipped = pageText;
+    if (clipped.length() > MAX_LEN) {
+        clipped = clipped.left(MAX_LEN) + "\n...[内容已截断]";
+    }
+
+    return "【以下是我正在浏览的文件《" + fileName + "》第 "
+           + QString::number(page) + " 页的内容片段，已经直接提供给你。"
+           "请直接基于以下内容回答我的问题，不要调用 read_file 或 read_html_page 等文件读取工具。】\n"
+           + clipped + "\n\n【我的问题】\n" + userContent;
+}
+
+void ChatEngine::doSendMessage(const QString &finalContent)
+{
     m_context.append(QJsonObject{{"role","user"},{"content",finalContent}});
 
     m_toolCancelled = false;

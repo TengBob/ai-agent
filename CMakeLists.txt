@@ -16,6 +16,7 @@ find_package(Qt6 REQUIRED COMPONENTS
     Network
     WebEngineQuick
     Concurrent
+    WebChannel
 )
 
 qt_standard_project_setup(REQUIRES 6.5)
@@ -34,6 +35,7 @@ qt_add_executable(appstock_project
     src/services/TemplateStore.cpp
     src/services/Tracker.cpp
     src/services/PdfConverter.cpp
+    src/services/PageTextCache.cpp
     src/tools/ToolRegistry.cpp
     src/tools/ToolExecutor.cpp
 )
@@ -55,6 +57,7 @@ qt_add_qml_module(appstock_project
         qml/components/MessageBubble.qml
         qml/components/AgentCard.qml
         qml/components/TokenIndicator.qml
+        RESOURCES
 )
 
 target_include_directories(appstock_project PRIVATE
@@ -81,6 +84,7 @@ target_link_libraries(appstock_project
         Qt6::Network
         Qt6::WebEngineQuick
         Qt6::Concurrent
+        Qt6::WebChannel
 )
 
 install(TARGETS appstock_project
