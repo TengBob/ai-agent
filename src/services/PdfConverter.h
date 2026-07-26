@@ -47,6 +47,14 @@ public:
     Q_INVOKABLE QString readHtmlPage(const QString &htmlPath, int page) const;
     Q_INVOKABLE void extractHtmlPageAsync(const QString &htmlPath, int page) const;
 
+    // Progressive loading API
+    Q_INVOKABLE int pageCount(const QString &htmlPath) const;
+    Q_INVOKABLE QVariantMap buildSkeletonData(const QString &htmlPath, int startPage, int endPage) const;
+    Q_INVOKABLE QVariantList extractPageRange(const QString &htmlPath, int startPage, int endPage) const;
+    Q_INVOKABLE void buildSkeletonAsync(const QString &htmlPath, int startPage, int endPage);
+    Q_INVOKABLE void extractPageRangeAsync(const QString &htmlPath, int startPage, int endPage);
+    Q_INVOKABLE void deleteOldSkeletons(const QString &htmlPath, const QString &keepSkeletonPath);
+
     Q_INVOKABLE bool saveMarkdownNote(const QString &htmlPath, const QString &fileName,
                                        const QString &content, bool append = false) const;
     Q_INVOKABLE bool fileExists(const QString &path) const;
@@ -66,6 +74,10 @@ signals:
     void htmlPageExtracted(const QString &htmlPath, int page, const QString &tmpPath);
     void htmlFilesScanned(const QVariantList &files);
     void pdf2HtmlEXAvailabilityChanged(bool available);
+    void skeletonReady(const QString &htmlPath, const QString &skeletonPath,
+                       int totalPages, int startPage, int endPage);
+    void pageRangeReady(const QString &htmlPath, int startPage, int endPage,
+                        const QVariantList &pages);
 
 private slots:
     void onProcessReadyRead();
@@ -76,6 +88,7 @@ private:
     void setIsConverting(bool v);
     void appendDetectLog(const QString &line);
     bool ensureKnowledgeBaseDir();
+    QString buildFullSkeletonHtml(const QString &htmlPath, int startPage, int endPage, int *outTotalPages) const;
     QVariantList scanHtmlFiles(const QString &base, const QHash<QString, QString> &dirToTitle) const;
     int insertDocument(const QString &title, const QString &sourcePath);
     bool updateDocumentStatus(int docId, const QString &status, const QString &errorMsg = QString());

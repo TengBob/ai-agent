@@ -640,6 +640,8 @@ QVariantList PdfConverter::scanHtmlFiles(const QString &base, const QHash<QStrin
         it.next();
         const QString fullPath = it.filePath();
         const QString fileName = it.fileName();
+        if (fileName.startsWith(QLatin1String("stock_kb_skel")))
+            continue;
         const QString rel = QDir(base).relativeFilePath(fullPath);
         const QString parentDir = it.fileInfo().dir().dirName();
         const QString parentPath = QDir::fromNativeSeparators(it.fileInfo().dir().absolutePath());
@@ -971,6 +973,418 @@ void PdfConverter::extractHtmlPageAsync(const QString &htmlPath, int page) const
                                       Q_ARG(QString, tmpPath));
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Progressive loading helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Extract the raw <div class="pf" ...>...</div> block for a single page.
+// Uses delimiter scanning (no </div> depth tracking) so <script>/<style>
+// content can never confuse the boundary detection.
+static QString extractPageFragment(const QByteArray &data, int page)
+{
+    const QByteArray marker = QStringLiteral("data-page-no=\"%1\"").arg(page).toUtf8();
+    int markerPos = data.indexOf(marker);
+    if (markerPos < 0) {
+        // Fallback: older pdf2htmlEX uses id="pfN"
+        const QByteArray altMarker = QStringLiteral("id=\"pf%1\"").arg(page).toUtf8();
+        markerPos = data.indexOf(altMarker);
+    }
+    if (markerPos < 0)
+        return {};
+
+    // Walk back to find the opening <div that contains the marker.
+    int divStart = data.lastIndexOf("<div", markerPos);
+    if (divStart < 0)
+        return {};
+
+    // The end is the start of the *next* page div (located via data-page-no=),
+    // or </body>, or EOF.  Do NOT use '<div class="pf' — pdf2htmlEX may emit
+    // 'id="pfN" class="pf w0 h0"' where class does not start with "pf".
+    const QByteArray nextMarker = QStringLiteral("data-page-no=\"%1\"").arg(page + 1).toUtf8();
+    int nextMarkerPos = data.indexOf(nextMarker, divStart + 1);
+    int endPos;
+    if (nextMarkerPos >= 0) {
+        // Walk back from the next page marker to its opening <div
+        int nextDivStart = data.lastIndexOf("<div", nextMarkerPos);
+        endPos = (nextDivStart > divStart) ? nextDivStart : nextMarkerPos;
+    } else {
+        int bodyEnd = data.indexOf("</body>", divStart + 1);
+        endPos = (bodyEnd >= 0) ? bodyEnd : data.size();
+    }
+
+    return QString::fromUtf8(data.constData() + divStart, endPos - divStart);
+}
+
+// Count how many pages a pdf2htmlEX HTML file contains.
+int PdfConverter::pageCount(const QString &htmlPath) const
+{
+    QFile f(htmlPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return 0;
+
+    const qint64 fileSize = f.size();
+    if (fileSize <= 0)
+        return 0;
+
+    uchar *mapped = f.map(0, fileSize);
+    if (!mapped)
+        return 0;
+
+    const QByteArray data = QByteArray::fromRawData(reinterpret_cast<const char *>(mapped), fileSize);
+    const QByteArray needle = "data-page-no=\"";
+    int count = 0;
+    int pos = 0;
+    while ((pos = data.indexOf(needle, pos)) >= 0) {
+        ++count;
+        pos += needle.size();
+    }
+
+    f.unmap(mapped);
+    return count;
+}
+
+// Build skeleton data synchronously: extract head + initial window pages.
+// Returns { "head": QString, "pages": QVariantList[{pageNo,html}], "totalPages": int }
+QVariantMap PdfConverter::buildSkeletonData(const QString &htmlPath, int startPage, int endPage) const
+{
+    QFile f(htmlPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+
+    const qint64 fileSize = f.size();
+    if (fileSize <= 0)
+        return {};
+
+    uchar *mapped = f.map(0, fileSize);
+    if (!mapped)
+        return {};
+
+    const QByteArray data = QByteArray::fromRawData(reinterpret_cast<const char *>(mapped), fileSize);
+
+    // Extract <head>...</head>
+    QString headHtml;
+    const QByteArray headStartMarker = "<head";
+    const QByteArray headEndMarker   = "</head>";
+    int headStart = data.indexOf(headStartMarker);
+    if (headStart >= 0) {
+        int headEnd = data.indexOf(headEndMarker, headStart);
+        if (headEnd > headStart) {
+            headEnd += headEndMarker.size();
+            headHtml = QString::fromUtf8(data.constData() + headStart, headEnd - headStart);
+        }
+    }
+
+    // Count total pages
+    const QByteArray needle = "data-page-no=\"";
+    int total = 0;
+    int pos = 0;
+    while ((pos = data.indexOf(needle, pos)) >= 0) { ++total; pos += needle.size(); }
+
+    // Extract initial window pages
+    QVariantList pages;
+    for (int p = startPage; p <= endPage; ++p) {
+        QString html = extractPageFragment(data, p);
+        if (!html.isEmpty())
+            pages.append(QVariantMap{{"pageNo", p}, {"html", html}});
+    }
+
+    f.unmap(mapped);
+
+    return QVariantMap{
+        {"head",       headHtml},
+        {"pages",      pages},
+        {"totalPages", total}
+    };
+}
+
+// Extract a range of page fragments synchronously.
+// Returns QVariantList[{pageNo, html}]
+QVariantList PdfConverter::extractPageRange(const QString &htmlPath, int startPage, int endPage) const
+{
+    QFile f(htmlPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+
+    const qint64 fileSize = f.size();
+    if (fileSize <= 0)
+        return {};
+
+    uchar *mapped = f.map(0, fileSize);
+    if (!mapped)
+        return {};
+
+    const QByteArray data = QByteArray::fromRawData(reinterpret_cast<const char *>(mapped), fileSize);
+
+    QVariantList pages;
+    for (int p = startPage; p <= endPage; ++p) {
+        QString html = extractPageFragment(data, p);
+        if (!html.isEmpty())
+            pages.append(QVariantMap{{"pageNo", p}, {"html", html}});
+    }
+
+    f.unmap(mapped);
+    return pages;
+}
+
+void PdfConverter::buildSkeletonAsync(const QString &htmlPath, int startPage, int endPage)
+{
+    qDebug() << "[PdfConverter] buildSkeletonAsync called path:" << htmlPath
+             << "startPage:" << startPage << "endPage:" << endPage;
+    PdfConverter *self = this;
+    QtConcurrent::run([self, htmlPath, startPage, endPage]() {
+        if (!self) return;
+        int totalPages = 0;
+        const QString skeletonHtml = self->buildFullSkeletonHtml(htmlPath, startPage, endPage, &totalPages);
+        qDebug() << "[PdfConverter] buildSkeletonAsync result: skeletonHtml.isEmpty()=" << skeletonHtml.isEmpty()
+                 << "totalPages=" << totalPages << "path=" << htmlPath;
+        if (skeletonHtml.isEmpty()) return;
+
+        // Write skeleton to a temp file in the same directory as the original HTML so
+        // that relative resource paths (CSS, fonts, JS) resolve correctly when loaded
+        // via webView.url = "file:///...".  Use a timestamped name so Chromium never
+        // serves a cached version and concurrent rapid clicks don't corrupt each other.
+        const QString dir = QFileInfo(htmlPath).absolutePath();
+        const QString tmpPath = dir + "/stock_kb_skel_"
+                              + QString::number(QDateTime::currentMSecsSinceEpoch()) + ".html";
+        QFile f(tmpPath);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
+            return;
+        f.write(skeletonHtml.toUtf8());
+        f.close();
+
+        // Do NOT delete old skeleton files here — cleanup happens on the main thread
+        // in onSkeletonReady (QML) after webView.url is set, so Chromium has already
+        // opened the file before any deletion occurs.
+
+        const QString fwdPath = QDir::fromNativeSeparators(tmpPath);
+        QMetaObject::invokeMethod(self,
+                                  "skeletonReady",
+                                  Qt::QueuedConnection,
+                                  Q_ARG(QString, htmlPath),
+                                  Q_ARG(QString, fwdPath),
+                                  Q_ARG(int,     totalPages),
+                                  Q_ARG(int,     startPage),
+                                  Q_ARG(int,     endPage));
+    });
+}
+
+// Inline JS injected into every skeleton page. Handles __kbLoadPage, __KB_PAGE__,
+// and __KB_REQ__ scroll detection. Must match the QML getSkeletonJavaScript() logic.
+static const char *SKELETON_JS = R"js(
+<script>
+(function(){
+'use strict';
+console.log('__KB_SKELETON_INIT__');
+window.__kbLoadPage = function(pageNum, divHtml) {
+    var ph = document.querySelector('.pf[data-page-no="' + pageNum + '"][data-loaded="false"]');
+    if (!ph) return false;
+    var w = document.createElement('div');
+    w.innerHTML = divHtml;
+    var real = w.querySelector('.pf');
+    if (!real) return false;
+    real.dataset.loaded = 'true';
+    ph.parentNode.replaceChild(real, ph);
+    return true;
+};
+window.__kbLoadedCount = function() {
+    return document.querySelectorAll('.pf[data-loaded="true"]').length;
+};
+window.__kbProgressiveActive = true;
+var pc = document.getElementById('page-container');
+if (!pc) return;
+var scrollTimer = null;
+pc.addEventListener('scroll', function() {
+    var pfs = pc.querySelectorAll('.pf[data-loaded="true"]');
+    var sy = pc.scrollTop;
+    for (var i = 0; i < pfs.length; i++) {
+        if (pfs[i].offsetTop + pfs[i].offsetHeight * 0.5 > sy) {
+            console.log('__KB_PAGE__:' + parseInt(pfs[i].dataset.pageNo));
+            break;
+        }
+    }
+    if (!window.__kbProgressiveActive) return;
+    if (scrollTimer) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(function() {
+        var viewH = window.innerHeight;
+        var scrollTop = pc.scrollTop;
+        var scrollBottom = scrollTop + viewH;
+        var range = viewH * 1.5;
+        var phs = pc.querySelectorAll('.pf[data-loaded="false"]');
+        var need = [];
+        phs.forEach(function(el) {
+            var top = el.offsetTop;
+            var bottom = top + el.offsetHeight;
+            if (bottom > scrollTop - range && top < scrollBottom + range)
+                need.push(parseInt(el.dataset.pageNo));
+        });
+        if (need.length === 0) return;
+        need.sort(function(a,b){return a-b;});
+        var ranges = [];
+        var rs = need[0], re = need[0];
+        for (var j = 1; j < need.length; j++) {
+            if (need[j] === re + 1) { re = need[j]; }
+            else { ranges.push([rs, re]); rs = need[j]; re = need[j]; }
+        }
+        ranges.push([rs, re]);
+        ranges.forEach(function(r){ console.log('__KB_REQ__:' + r[0] + ',' + r[1]); });
+    }, 150);
+}, {passive: true});
+})();
+</script>
+)js";
+
+static const char *PLACEHOLDER_STYLE =
+    "<style>"
+    // Ensure the webview document fills the frame so the absolute-positioned
+    // #page-container (pdf2htmlEX default) can stretch top:0;bottom:0 correctly.
+    "html,body{height:100%;margin:0;padding:0}"
+    // pdf2htmlEX renders .pf with position:relative already; make it block so
+    // placeholder divs participate in normal flow and give the container height.
+    ".pf{position:relative !important;display:block !important;"
+    "width:595px;margin:13px auto}"
+    ".pf-placeholder{min-height:1123px;width:595px;margin:13px auto;"
+    "background:#f5f5f5;display:flex;"
+    "align-items:center;justify-content:center;color:#bdbdbd;"
+    "font-family:sans-serif;font-size:14px;border-bottom:1px dashed #e0e0e0}"
+    ".pf-placeholder::after{content:\"\\7B2C \" attr(data-page-no) \" \\9875 \\2014 \\52A0\\8F7D\\4E2D...\"}"
+    "</style>\n";
+
+// Build the complete skeleton HTML in the background thread.
+// All string assembly happens here so the QML main thread receives a single QString.
+QString PdfConverter::buildFullSkeletonHtml(const QString &htmlPath,
+                                             int startPage, int endPage,
+                                             int *outTotalPages) const
+{
+    if (outTotalPages) *outTotalPages = 0;
+
+    QFile f(htmlPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+
+    const qint64 fileSize = f.size();
+    if (fileSize <= 0)
+        return {};
+
+    uchar *mapped = f.map(0, fileSize);
+    if (!mapped)
+        return {};
+
+    const QByteArray data = QByteArray::fromRawData(
+        reinterpret_cast<const char *>(mapped), static_cast<int>(fileSize));
+
+    // 1. Extract <head>...</head> and strip inline <script> blocks.
+    // pdf2htmlEX embeds JS in <head> that tries to access DOM nodes not present
+    // in the skeleton, causing uncaught exceptions that break runJavaScript callbacks.
+    QString headHtml;
+    {
+        const QByteArray headStart = "<head";
+        const QByteArray headEnd   = "</head>";
+        int hs = data.indexOf(headStart);
+        if (hs >= 0) {
+            int he = data.indexOf(headEnd, hs);
+            if (he > hs) {
+                he += headEnd.size();
+                QString raw = QString::fromUtf8(data.constData() + hs, he - hs);
+                // Remove every <script ...>...</script> block from the head.
+                static const QRegularExpression scriptRe(
+                    QStringLiteral("<script[^>]*>.*?</script>"),
+                    QRegularExpression::DotMatchesEverythingOption
+                    | QRegularExpression::CaseInsensitiveOption);
+                headHtml = raw.remove(scriptRe);
+            }
+        }
+    }
+
+    // 2. Count total pages and collect positions for initial window pages
+    const QByteArray needle = "data-page-no=\"";
+    int total = 0;
+    {
+        int pos = 0;
+        while ((pos = data.indexOf(needle, pos)) >= 0) { ++total; pos += needle.size(); }
+    }
+    if (outTotalPages) *outTotalPages = total;
+
+    // 3. Extract initial window page fragments
+    QHash<int, QString> pageMap;
+    for (int p = startPage; p <= endPage; ++p) {
+        QString html = extractPageFragment(data, p);
+        if (!html.isEmpty())
+            pageMap.insert(p, html);
+    }
+
+    f.unmap(mapped);
+
+    // 4. Assemble full HTML – all in this background thread
+    // Pre-size the result to avoid repeated reallocation.
+    // Estimate: head + placeholder_style + (10 loaded pages * ~100KB) + (N-10 placeholders * ~160B) + JS
+    const int estimatedSize = headHtml.size()
+                              + pageMap.size() * 120000
+                              + (total - pageMap.size()) * 200
+                              + 3000;
+    QString out;
+    out.reserve(estimatedSize);
+
+    out += QLatin1String("<!DOCTYPE html>\n<html>\n");
+    out += headHtml;
+    out += QLatin1String(PLACEHOLDER_STYLE);
+    out += QLatin1String("<body>\n<div id=\"page-container\">\n");
+
+    for (int p = 1; p <= total; ++p) {
+        auto it = pageMap.find(p);
+        if (it != pageMap.end()) {
+            // Inject data-loaded="true" attribute into the opening <div class="pf"...>
+            const QString &pfHtml = it.value();
+            int gtPos = pfHtml.indexOf('>');  // position of first '>' after <div
+            if (gtPos > 0) {
+                out += pfHtml.left(gtPos);
+                out += QLatin1String(" data-loaded=\"true\">");
+                out += pfHtml.mid(gtPos + 1);
+            } else {
+                out += pfHtml;
+            }
+            out += QLatin1Char('\n');
+        } else {
+            out += QLatin1String("<div class=\"pf pf-placeholder\" data-page-no=\"");
+            out += QString::number(p);
+            out += QLatin1String("\" data-loaded=\"false\"></div>\n");
+        }
+    }
+
+    out += QLatin1String("</div>\n");
+    out += QLatin1String(SKELETON_JS);
+    out += QLatin1String("\n</body>\n</html>");
+
+    return out;
+}
+
+void PdfConverter::extractPageRangeAsync(const QString &htmlPath, int startPage, int endPage)
+{
+    PdfConverter *self = this;
+    QtConcurrent::run([self, htmlPath, startPage, endPage]() {
+        if (!self) return;
+        const QVariantList pages = self->extractPageRange(htmlPath, startPage, endPage);
+        QMetaObject::invokeMethod(self,
+                                  "pageRangeReady",
+                                  Qt::QueuedConnection,
+                                  Q_ARG(QString,      htmlPath),
+                                  Q_ARG(int,          startPage),
+                                  Q_ARG(int,          endPage),
+                                  Q_ARG(QVariantList, pages));
+    });
+}
+
+void PdfConverter::deleteOldSkeletons(const QString &htmlPath, const QString &keepSkeletonPath)
+{
+    const QString dir = QFileInfo(htmlPath).absolutePath();
+    const QString keepName = QFileInfo(keepSkeletonPath).fileName();
+    const QStringList oldFiles = QDir(dir).entryList(
+        QStringList() << QStringLiteral("stock_kb_skel_*.html"), QDir::Files);
+    for (const QString &old : oldFiles) {
+        if (old != keepName)
+            QFile::remove(dir + QLatin1Char('/') + old);
+    }
 }
 
 bool PdfConverter::saveMarkdownNote(const QString &htmlPath, const QString &fileName,

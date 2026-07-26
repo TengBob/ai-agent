@@ -32,6 +32,10 @@ Page {
         pdfConverter.htmlFilesScanned.connect(onHtmlFilesScanned)
         console.log("[KB] connect pdf2HtmlEXAvailabilityChanged...")
         pdfConverter.pdf2HtmlEXAvailabilityChanged.connect(onPdf2HtmlEXAvailabilityChanged)
+        console.log("[KB] connect skeletonReady...")
+        pdfConverter.skeletonReady.connect(onSkeletonReady)
+        console.log("[KB] connect pageRangeReady...")
+        pdfConverter.pageRangeReady.connect(onPageRangeReady)
         console.log("[KB] connect chatEngine messageReceived...")
         chatEngine.messageReceived.connect(onKbChatMessage)
         console.log("[KB] connect chatEngine toolLogReceived...")
@@ -66,6 +70,8 @@ Page {
         pdfConverter.htmlPageExtracted.disconnect(onHtmlPageExtracted)
         pdfConverter.htmlFilesScanned.disconnect(onHtmlFilesScanned)
         pdfConverter.pdf2HtmlEXAvailabilityChanged.disconnect(onPdf2HtmlEXAvailabilityChanged)
+        pdfConverter.skeletonReady.disconnect(onSkeletonReady)
+        pdfConverter.pageRangeReady.disconnect(onPageRangeReady)
         chatEngine.messageReceived.disconnect(onKbChatMessage)
         chatEngine.toolLogReceived.disconnect(onToolLog)
         agentManager.agentsChanged.disconnect(onAgentsChanged)
@@ -84,19 +90,54 @@ Page {
     }
 
     function loadHtmlFile(path, page) {
-        if (!webViewReady) {
-            console.log("[KB] revealing WebEngineView on file selection:", path)
-            pendingWebViewLoad = { path: path, page: page }
-            webViewReady = true
+        console.log("[KB] loadHtmlFile path:", path, "page:", page, "webViewVisible:", webViewVisible, "timerRunning:", webViewRevealTimer.running)
+        // Always keep pending up-to-date so the timer fires with the latest path.
+        pendingWebViewLoad = { path: path, page: page }
+
+        if (!webViewVisible) {
+            // First call: make the WebEngineView visible and let Chromium start.
+            console.log("[KB] loadHtmlFile -> webViewVisible=false, starting reveal timer")
+            webViewVisible = true
             webViewRevealTimer.start()
             return
         }
 
+        if (webViewRevealTimer.running) {
+            // Timer is still counting down (200ms window).
+            // pending is already updated above — just wait for the timer.
+            console.log("[KB] loadHtmlFile -> timer still running, will fire later")
+            return
+        }
+
+        // WebView is visible and timer has already fired: load immediately.
+        console.log("[KB] loadHtmlFile -> calling doLoadHtmlFile directly")
+        pendingWebViewLoad = null
+        doLoadHtmlFile(path, page)
+    }
+
+    function doLoadHtmlFile(path, page) {
+        console.log("[KB] doLoadHtmlFile path:", path, "page:", page)
+        webViewEverLoaded = true
         selectedHtmlPath = path
         const targetPage = Math.max(1, page)
         htmlCurrentPage = targetPage
         htmlCurrentInput = "" + targetPage
         htmlTotalPages = 0
+
+        // Reset progressive loading state for each new file load.
+        loadSequence++
+        isLargeFile = false
+        isProgressiveLoading = false
+        loadingProgress = 0.0
+        totalPagesInFile = 0
+        loadedPagesSet = ({})
+        pendingPages = ({})
+        skeletonWindowStart = 0
+        skeletonWindowEnd = 0
+        skeletonReady = false
+        backgroundLoadFinished = false
+        pendingJumpPage = 0
+        pendingInjections = []
 
         const isMarkdown = /\.md$/i.test(path)
         if (isMarkdown) {
@@ -107,7 +148,30 @@ Page {
             return
         }
 
-        // Always display the original HTML file directly in WebEngineView.
+        // Check file size; large HTML files use progressive loading.
+        const info = pdfConverter.fileInfo(path)
+        if (info.size >= largeFileThreshold) {
+            isLargeFile = true
+            isProgressiveLoading = true
+
+            // totalPagesInFile is unknown until async completes; use 0 as sentinel.
+            totalPagesInFile = 0
+
+            // winEnd uses a safe upper bound; buildSkeletonAsync will not exceed actual total.
+            const winStart = Math.max(1, targetPage - 2)
+            const winEnd   = targetPage + 7    // C++ clamps to actual page count
+
+            skeletonWindowStart = winStart
+            skeletonWindowEnd   = winEnd
+
+            if (targetPage > 1) pendingJumpPage = targetPage
+
+            expectedSkeletonSeq = loadSequence
+            pdfConverter.buildSkeletonAsync(path, winStart, winEnd)
+            return
+        }
+
+        // Small file: direct load.
         webView.url = "file:///" + path.replace(/\\/g, "/")
         if (targetPage > 1) {
             webView.onLoadingChanged.connect(function jumpOnce(req) {
@@ -117,9 +181,6 @@ Page {
                 }
             })
         }
-
-        // We no longer extract text on every page turn; the context is read
-        // lazily from C++ when the user actually sends a message.
     }
 
     function installScrollDetector() {
@@ -147,6 +208,172 @@ Page {
     }, {passive: true});
 })();
         `)
+    }
+
+    function updateLoadingProgress() {
+        if (!isLargeFile || totalPagesInFile <= 0) return
+        const loaded = Object.keys(loadedPagesSet).length
+        loadingProgress = loaded / totalPagesInFile
+
+        const pendingCount = Object.keys(pendingPages).length
+        if (backgroundLoadFinished && pendingCount === 0) {
+            isProgressiveLoading = false
+            loadingProgress = 1.0
+        }
+    }
+
+    function doScrollToPage(page) {
+        webView.runJavaScript(
+            "(function(p){" +
+            "var pc=document.getElementById('page-container');" +
+            "if(!pc) return;" +
+            "var el=pc.querySelector('.pf[data-page-no=\"'+p+'\"]');" +
+            "if(el){pc.scrollTop=el.offsetTop;return;}" +
+            "var near=pc.querySelector('.pf[data-loaded=\"true\"]');" +
+            "if(near)pc.scrollTop=near.offsetTop;" +
+            "})(" + page + ");"
+        )
+    }
+
+    function onSkeletonReady(htmlPath, skeletonPath, totalPages, startPage, endPage) {
+        console.log("[KB] onSkeletonReady htmlPath:", htmlPath, "selected:", selectedHtmlPath,
+                    "skeletonReady:", skeletonReady, "seq:", loadSequence, "expectedSeq:", expectedSkeletonSeq,
+                    "skeletonPath:", skeletonPath)
+        if (htmlPath !== selectedHtmlPath) return
+        if (skeletonReady) return
+        // Reject callbacks from a previous load sequence (two rapid clicks same file).
+        if (loadSequence !== expectedSkeletonSeq) return
+
+        totalPagesInFile = totalPages > 0 ? totalPages : 1
+        skeletonWindowStart = startPage
+        skeletonWindowEnd   = endPage
+
+        if (!webViewVisible) {
+            webViewVisible = true
+        }
+
+        // Load via url — Chromium reads from disk, zero main-thread string copy.
+        lastSkeletonPath = skeletonPath
+        webView.url = "file:///" + skeletonPath
+        skeletonReady = true
+
+        // Delete leftover skeleton files from previous runs now that Chromium has
+        // opened the new file. Done here on the main thread to avoid the race where
+        // a concurrent background thread deletes another thread's freshly-written file.
+        pdfConverter.deleteOldSkeletons(htmlPath, skeletonPath)
+
+        // Mark the initial window as loaded (C++ already injected data-loaded="true").
+        var newSet = ({})
+        for (var i = startPage; i <= endPage; i++)
+            newSet[i] = true
+        loadedPagesSet = newSet
+
+        updateLoadingProgress()
+    }
+
+    function onPageRangeReady(htmlPath, startPage, endPage, pages) {
+        if (htmlPath !== selectedHtmlPath) return
+        console.log("[KB] onPageRangeReady htmlPath:", htmlPath, "pages:", pages.length,
+                    "webView.loading:", webView.loading)
+
+        // Always do bookkeeping regardless of loading state,
+        // so pending markers are cleared and pages aren't re-requested.
+        for (var j = 0; j < pages.length; j++) {
+            var pn = pages[j].pageNo
+            loadedPagesSet[pn] = true
+            delete pendingPages[pn]
+        }
+        loadedPagesSet = loadedPagesSet  // notify binding
+        pendingPages   = pendingPages    // notify binding
+
+        updateLoadingProgress()
+
+        if (pages.length === 0) return
+
+        if (webView.loading) {
+            // webView is navigating — defer injection until LoadSucceeded.
+            // Concat rather than replace so multiple batches accumulate safely.
+            pendingInjections = pendingInjections.concat(pages)
+            return
+        }
+
+        injectPages(pages)
+
+        if (pendingJumpPage > 0 &&
+            pendingJumpPage >= startPage && pendingJumpPage <= endPage) {
+            const jumpTarget = pendingJumpPage
+            pendingJumpPage = 0
+            Qt.callLater(function() { doScrollToPage(jumpTarget) })
+        }
+    }
+
+    function injectPages(pages) {
+        if (pages.length === 0) return
+        var jsParts = []
+        for (var i = 0; i < pages.length; i++) {
+            var p = pages[i]
+            jsParts.push('__kbLoadPage(' + p.pageNo + ',' + JSON.stringify(p.html) + ');')
+        }
+        webView.runJavaScript(jsParts.join('\n'))
+    }
+
+    function scheduleBackgroundLoad() {
+        if (!isLargeFile) return
+        const currentSeq = loadSequence
+
+        var unloaded = []
+        for (var i = 1; i <= totalPagesInFile; i++) {
+            if (!loadedPagesSet[i] && !pendingPages[i]) unloaded.push(i)
+        }
+        console.log("[KB] scheduleBackgroundLoad totalPages:", totalPagesInFile,
+                    "unloaded:", unloaded.length, "seq:", currentSeq)
+        if (unloaded.length === 0) {
+            backgroundLoadFinished = true
+            updateLoadingProgress()
+            return
+        }
+
+        const current = htmlCurrentPage
+        unloaded.sort(function(a, b) { return Math.abs(a - current) - Math.abs(b - current) })
+
+        isProgressiveLoading = true
+        backgroundLoadFinished = false
+        processBackgroundBatch(unloaded, 0, currentSeq)
+    }
+
+    function processBackgroundBatch(pages, index, seq) {
+        if (seq !== loadSequence) return
+
+        if (index >= pages.length) {
+            backgroundLoadFinished = true
+            updateLoadingProgress()
+            return
+        }
+
+        const batchSize = 10
+        var batch = []
+        var i = index
+        while (batch.length < batchSize && i < pages.length) {
+            if (!pendingPages[pages[i]]) {
+                pendingPages[pages[i]] = true
+                batch.push(pages[i])
+            }
+            i++
+        }
+
+        if (batch.length === 0) {
+            processBackgroundBatch(pages, i, seq)
+            return
+        }
+
+        pendingPages = pendingPages  // notify binding
+
+        const startPage = batch[0]
+        const endPage   = batch[batch.length - 1]
+        pdfConverter.extractPageRangeAsync(selectedHtmlPath, startPage, endPage)
+
+        const nextIndex = i
+        Qt.callLater(function() { processBackgroundBatch(pages, nextIndex, seq) })
     }
 
     property string toolLogText: ""
@@ -202,8 +429,30 @@ Page {
     // Defer WebEngineView visibility: the Chromium render process starts when the
     // view first becomes visible and blocks the event loop. Let the page UI paint
     // first, then reveal the view in a subsequent event loop iteration.
-    property bool   webViewReady: false
+    // webViewVisible: controls WebEngineView.visible (职责A - 渲染进程启动)
+    // webViewEverLoaded: true once doLoadHtmlFile() has been called at least once (职责B - 首次加载门控)
+    property bool   webViewVisible: false
+    property bool   webViewEverLoaded: false
     property var    pendingWebViewLoad: null
+
+    // ── Progressive loading state ──────────────────────────────────────────
+    property bool   isLargeFile: false
+    property bool   isProgressiveLoading: false
+    property real   loadingProgress: 0.0
+    property int    totalPagesInFile: 0
+    property int    largeFileThreshold: 500 * 1024   // 500 KB
+    property int    loadSequence: 0
+    property int    expectedSkeletonSeq: 0
+    property var    loadedPagesSet: ({})
+    property var    pendingPages: ({})
+    property int    skeletonWindowStart: 0
+    property int    skeletonWindowEnd: 0
+    property bool   skeletonReady: false
+    property bool   backgroundLoadFinished: false
+    property int    pendingJumpPage: 0               // 0 = no pending jump
+    property string lastSkeletonPath: ""             // temp skeleton file to delete on next load
+    property var    pendingInjections: []            // pages queued while webView was loading
+    // ───────────────────────────────────────────────────────────────────────
 
     // Bridge used by the WebEngineView scroll detector to report the current
     // page without polling.
@@ -346,7 +595,6 @@ Page {
         if (pdfConverter.deleteNoteFile(pendingDeleteNotePath)) {
             if (selectedHtmlPath === pendingDeleteNotePath) {
                 selectedHtmlPath = ""
-                webViewReady = false
             }
             loadHtmlFiles()
             errorBar.color = "#E8F5E9"
@@ -1254,7 +1502,7 @@ Page {
                         }
 
                         RowLayout {
-                            visible: selectedHtmlPath !== "" && htmlTotalPages > 0
+                            visible: selectedHtmlPath !== "" && (htmlTotalPages > 0 || totalPagesInFile > 0)
                             spacing: 4
                             Rectangle {
                                 width: 28; height: 28; radius: 4
@@ -1281,7 +1529,7 @@ Page {
                                 }
                             }
                             Text {
-                                text: "/ " + htmlTotalPages
+                                text: "/ " + (isLargeFile ? totalPagesInFile : htmlTotalPages)
                                 font.pixelSize: 12; color: "#616161"
                             }
                             Rectangle {
@@ -1319,7 +1567,7 @@ Page {
                         }
 
                         Rectangle {
-                            visible: selectedHtmlPath !== "" && savedHtmlPage > 0 && savedHtmlPage !== htmlCurrentPage && savedHtmlPage <= htmlTotalPages
+                            visible: selectedHtmlPath !== "" && savedHtmlPage > 0 && savedHtmlPage !== htmlCurrentPage && savedHtmlPage <= (isLargeFile ? totalPagesInFile : htmlTotalPages)
                             width: 78; height: 28; radius: 4
                             color: lastReadHov.containsMouse ? "#E8F5E9" : "transparent"
                             border.color: "#81C784"; border.width: 1
@@ -1360,25 +1608,69 @@ Page {
                     }
                 }
 
+                // Progressive loading progress bar
+                Rectangle {
+                    id: progressBar
+                    visible: isProgressiveLoading
+                    anchors { top: previewToolbar.bottom; left: parent.left; right: parent.right }
+                    height: 3
+                    color: "#E3F2FD"
+                    z: 10
+                    Rectangle {
+                        width: parent.width * loadingProgress
+                        height: parent.height
+                        color: "#1976D2"
+                        Behavior on width { NumberAnimation { duration: 200 } }
+                    }
+                }
+
                 WebEngineView {
                     id: webView
                     anchors { top: previewToolbar.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
-                    visible: webViewReady
+                    visible: webViewVisible
                     webChannel: kbWebChannel
                     settings.javascriptEnabled: true
                     settings.localContentCanAccessFileUrls: true
 
-                    onVisibleChanged: {
-                        console.log("[KB] webView visible:", visible, "url:", url)
+                    onNavigationRequested: function(req) {
+                        console.log("[KB] navReq url:", req.url, "type:", req.navigationType, "mainFrame:", req.isMainFrame, "accepted:", req.accepted)
+                        req.accept()
+                        console.log("[KB] navReq after accept, accepted:", req.accepted)
                     }
 
                     onJavaScriptConsoleMessage: function(level, message, lineNumber, sourceID) {
                         if (!message) return
-                        const prefix = '__KB_PAGE__:'
-                        if (message.indexOf(prefix) === 0) {
-                            const page = parseInt(message.substring(prefix.length), 10)
-                            kbBridge.reportPage(page)
+                        if (message === '__KB_SKELETON_INIT__') {
+                            console.log("[KB] skeleton JS initialized in page")
+                            return
                         }
+                        if (message.indexOf('__KB_PAGE__:') === 0) {
+                            const page = parseInt(message.substring('__KB_PAGE__:'.length), 10)
+                            kbBridge.reportPage(page)
+                            return
+                        }
+                        if (message.indexOf('__KB_REQ__:') === 0 && isLargeFile) {
+                            const parts = message.substring('__KB_REQ__:'.length).split(',')
+                            if (parts.length !== 2) return
+                            const reqStart = parseInt(parts[0], 10)
+                            const reqEnd   = parseInt(parts[1], 10)
+                            if (isNaN(reqStart) || isNaN(reqEnd)) return
+                            // Collect pages in range not already loaded or pending.
+                            var needed = []
+                            for (var p = reqStart; p <= reqEnd; p++) {
+                                if (!loadedPagesSet[p] && !pendingPages[p]) {
+                                    pendingPages[p] = true
+                                    needed.push(p)
+                                }
+                            }
+                            if (needed.length > 0) {
+                                pendingPages = pendingPages  // notify binding
+                                pdfConverter.extractPageRangeAsync(selectedHtmlPath, needed[0], needed[needed.length - 1])
+                            }
+                            return
+                        }
+                        // Forward all other JS console messages to Qt output for debugging
+                        console.log("[JS]", message)
                     }
 
                     Rectangle {
@@ -1405,15 +1697,31 @@ Page {
 
                     function jumpToPage(page) {
                         if (page < 1) return
-                        if (page > htmlTotalPages && htmlTotalPages > 0) return
+                        if (page > htmlTotalPages && htmlTotalPages > 0 && !isLargeFile) return
                         htmlCurrentPage = page
                         htmlCurrentInput = "" + page
-                        runJavaScript("var el=document.querySelector('div.pf[data-page-no=\\'" + page + "\\']'); if(el) el.scrollIntoView({behavior:'instant',block:'start'});")
+                        if (isLargeFile) {
+                            // For large files check if the page is already loaded in DOM.
+                            webView.runJavaScript(
+                                "(function(p){" +
+                                "var el=document.querySelector('.pf[data-page-no=\"'+p+'\"][data-loaded=\"true\"]');" +
+                                "return !!el;" +
+                                "})(" + page + ");",
+                                function(loaded) {
+                                    if (loaded) {
+                                        doScrollToPage(page)
+                                    } else {
+                                        pendingJumpPage = page
+                                    }
+                                }
+                            )
+                        } else {
+                            runJavaScript("var el=document.querySelector('div.pf[data-page-no=\\'" + page + "\\']'); if(el) el.scrollIntoView({behavior:'instant',block:'start'});")
+                        }
                     }
 
                     onLoadingChanged: function(req) {
-                        console.log("[KB] webView loadingChanged status:", req.status,
-                                    "url:", webView.url, "error:", req.errorString)
+                        console.log("[KB] webView loadingChanged status:", req.status, "url:", req.url)
                         if (req.status === WebEngineView.LoadSucceededStatus) {
                             runJavaScript(`
 (function(){
@@ -1424,14 +1732,48 @@ Page {
                             `)
                             updatePageCount()
                             installScrollDetector()
+                            // Debug: inspect page 45 specifically
+                            Qt.callLater(function() {
+                                webView.runJavaScript(
+                                    "(function(){" +
+                                    "var pc=document.getElementById('page-container');" +
+                                    "if(!pc) return 'NO_PC';" +
+                                    "var p45=pc.querySelector('.pf[data-page-no=\"45\"]');" +
+                                    "if(!p45) return 'NO_PF45';" +
+                                    "var r=p45.getBoundingClientRect();" +
+                                    "var cs=getComputedStyle(p45);" +
+                                    "return 'pf45: x='+Math.round(r.x)+' y='+Math.round(r.y)+' w='+Math.round(r.width)+' h='+Math.round(r.height)+' compW='+cs.width+' compH='+cs.height+' loaded='+p45.dataset.loaded+' pcScrollTop='+pc.scrollTop+' pf45.offsetTop='+p45.offsetTop;" +
+                                    "})()",
+                                    function(result) { console.log("[KB] pf45-inspect:", result) }
+                                )
+                            })
+                            // Flush pages that arrived while the skeleton was loading.
+                            if (pendingInjections.length > 0) {
+                                const toInject = pendingInjections
+                                pendingInjections = []
+                                injectPages(toInject)
+                            }
                             // Prefetch the landing page once; further pages come
                             // from the WebChannel scroll detector.
                             chatEngine.prefetchPage(selectedHtmlPath, htmlCurrentPage)
+                            // Jump to the saved page position (set when targetPage > 1).
+                            if (pendingJumpPage > 0) {
+                                const jumpTarget = pendingJumpPage
+                                pendingJumpPage = 0
+                                Qt.callLater(function() { doScrollToPage(jumpTarget) })
+                            }
+                            // Start background loading of remaining pages only after
+                            // the skeleton is fully loaded — runJavaScript is safe now.
+                            if (isLargeFile) Qt.callLater(scheduleBackgroundLoad)
                         } else if (req.status === WebEngineView.LoadFailedStatus) {
                             console.warn("[WebView] load failed:", req.errorString)
                             errorBar.text = "页面加载失败：" + (req.errorString || "未知错误")
                             errorBar.visible = true
                             errorTimer.restart()
+                        } else if (req.status === WebEngineView.LoadStoppedStatus) {
+                            const skelPath = lastSkeletonPath
+                            console.log("[KB] LoadStopped: lastSkeletonPath=", skelPath,
+                                        "fileExists=", pdfConverter.fileExists(skelPath))
                         }
                     }
                 }
@@ -1441,11 +1783,11 @@ Page {
                     interval: 200
                     repeat: false
                     onTriggered: {
+                        console.log("[KB] webViewRevealTimer fired, pendingWebViewLoad:", JSON.stringify(pendingWebViewLoad))
                         if (pendingWebViewLoad) {
                             const info = pendingWebViewLoad
                             pendingWebViewLoad = null
-                            console.log("[KB] webViewRevealTimer firing for:", info.path)
-                            loadHtmlFile(info.path, info.page)
+                            doLoadHtmlFile(info.path, info.page)
                         }
                     }
                 }

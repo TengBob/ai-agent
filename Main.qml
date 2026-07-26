@@ -261,9 +261,6 @@ ApplicationWindow {
                     item.htmlPageMap      = map
                     if (window.kbChatAgentId > 0)
                         item.restoreChat(window.kbChatAgentId)
-                    if (window.kbHtmlPath !== "") {
-                        item.loadHtmlFile(window.kbHtmlPath, restoredPage)
-                    }
                     console.timeEnd("[Main] kbLoader.onLoaded")
                     Qt.callLater(function() {
                         console.log("[Main] kbLoader item size delayed:", item ? (item.width + "x" + item.height) : "null")
